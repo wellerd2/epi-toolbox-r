@@ -1,4 +1,4 @@
-# epi-toolbox-r
+# Epi Toolbox for R
 
 `epi-toolbox-r` is a collection of helper functions for working with epidemiologic and surveillance data, as well as utilities for loading and managing data files in R and formatting analytical outputs for visualization.
 
@@ -40,3 +40,4 @@ source("R/compare_periods_by_species.R")
 source("R/calculate_average_annual_incidence.R")
 ```
 ## Citation
+1.	Weller, D. Epi Toolbox for R. 2026. https://github.com/wellerd2/epi-toolbox-r. doi.org/10.5281/zenodo.18509095.
