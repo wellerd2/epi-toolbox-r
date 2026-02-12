@@ -1,0 +1,211 @@
+---
+title: "Power simulation for longitudinal prevalence comparisons (GEE workflow)"
+author: "Daniel Weller"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4
+)
+```
+
+# Overview
+
+This R Markdown document provides a general, simulation-based workflow to estimate statistical power for a longitudinal observational study where you want to compare prevalence (binary outcome) under two conditions (e.g., season, exposure category, intervention vs. control context).
+
+The workflow simulates clustered, repeated binary measurements within units (e.g., households, farms, patients), then analyzes each simulated dataset using population-averaged logistic regression via GEE. Power is estimated as the fraction of simulations in which the condition effect is detected at a prespecified significance level.
+
+Use this when:
+1. the outcome is binary (positive/negative detection);
+2. measurements are repeated within units (longitudinal / clustered);
+3. the main estimand is an odds ratio (OR) comparing two conditions;
+4. correlation within units is expected and you want a practical power estimate under realistic clustering.
+
+Key modeling choices
+1. within-unit clustering is captured using a random intercept (unit-level shift) with standard deviation sd_unit.
+2. GEE logistic regression (geepack::geeglm) with exchangeable working correlation.
+3. power is an empirical estimate under the assumptions you specify.
+
+**Note** sd_unit is used only to generate correlation in simulated data. GEE does not estimate a random-effect variance; it estimates population-averaged effects while accounting for within-unit correlation.
+
+# Inputs you must specify (everything else follows from these)
+1. n_unit: number of units/clusters (e.g., households, farms, people)
+2. n_time: number of repeated measurements per unit
+3. p0: baseline prevalence in the reference condition (condition = 0)
+4. OR: smallest effect size you want power to detect (condition 1 vs 0)
+5. sd_unit: degree of within-unit clustering (random-intercept SD)
+
+# Considerations
+1. geeglm supports other working correlations (e.g., "ar1"). If you change the analysis correlation, consider also changing the simulation mechanism accordingly.
+2. if you care about risk differences rather than ORs, you can simulate the same way but fit a different model but note when implemented using lme4 a similar function generated warnings about singular boundaries
+3. estimated power is **only as good as your assumptions** (e.g., p0, OR, clustering)
+
+```{r}
+library(geepack)
+```
+
+# Simulate, analyze and estimate power
+Simulates longitudinal binary data with within-unit correlation and then fits a GEE model to test the condition effect.
+```{r}
+powerfinder <- function(
+  n_unit = 30,         # number of clusters/units
+  n_time = 6,          # repeated measures per unit
+  p0 = 0.40,           # baseline prevalence in reference condition (cond = 0)
+  OR = 2.0,            # odds ratio for condition (cond = 1 vs 0)
+  sd_unit = 1.0,       # random-intercept SD used ONLY to generate within-unit correlation
+  nsim = 1000,         # Monte Carlo simulations
+  alpha = 0.05,        # significance threshold
+  seed = NULL,         # optional seed for reproducibility
+  pattern = NULL,      # optional 0/1 vector of length n_time defining condition over time
+  corstr = "exchangeable" # GEE working correlation structure
+){
+  if (!is.null(seed)) set.seed(seed)
+
+  # Default: half time points in reference (0), half in comparison (1)
+  # Example: 0,0,0,1,1,1 for n_time=6
+  if (is.null(pattern)) {
+    pattern <- rep(c(0, 0, 0, 1, 1, 1), length.out = n_time)
+  }
+  stopifnot(length(pattern) == n_time)
+
+  b0 <- qlogis(p0)   # baseline log-odds in condition 0
+  b1 <- log(OR)      # condition effect on log-odds scale
+
+  detected <- logical(nsim)
+
+  for (s in seq_len(nsim)) {
+
+    # Unit-level random intercepts induce within-unit correlation
+    u <- rnorm(n_unit, mean = 0, sd = sd_unit)
+
+    id <- rep(seq_len(n_unit), each = n_time)
+    cond <- rep(pattern, times = n_unit)
+
+    eta <- b0 + b1 * cond + u[id]
+    y <- rbinom(n_unit * n_time, size = 1, prob = plogis(eta))
+
+    dat <- data.frame(y = y, cond = cond, id = id)
+
+    fit <- suppressWarnings(
+      geeglm(
+        y ~ cond,
+        id = id,
+        data = dat,
+        family = binomial,
+        corstr = corstr
+      )
+    )
+
+    pval <- summary(fit)$coefficients["cond", "Pr(>|W|)"]
+    detected[s] <- (!is.na(pval)) && (pval < alpha)
+  }
+
+  mean(detected)
+}
+```
+
+## Examples
+### Vary the effect size (OR)
+```{r}
+set.seed(1)
+sapply(c(1.5, 2, 3), \(or) powerfinder(
+  n_unit = 30, n_time = 6, p0 = 0.40, OR = or, sd_unit = 1.0, nsim = 1000
+))
+
+```
+### Vary clustering strength (sd_unit)
+```{r}
+set.seed(1)
+sapply(c(0.5, 1.0, 1.5), \(sd) powerfinder(
+  n_unit = 30, n_time = 6, p0 = 0.40, OR = 2.0, sd_unit = sd, nsim = 1000
+))
+```
+### Vary number of units (sample size curve
+```{r}
+set.seed(1)
+ns <- c(30, 40, 50, 60)
+pow <- sapply(ns, \(n) powerfinder(
+  n_unit = n, n_time = 6, p0 = 0.40, OR = 2.0, sd_unit = 1.0, nsim = 1000
+))
+data.frame(n_unit = ns, power = pow)
+```
+
+# Finding the minimum number of units for a target power
+Searches over candidate n_unit values to find the minimum that achieves target_power.
+```{r}
+unitfinder <- function(
+  target_power = 0.80,
+  n_time = 6,
+  p0 = 0.40,
+  OR = 2.0,
+  sd_unit = 1.0,
+  alpha = 0.05,
+  nsim = 500,
+  n_min = 10,
+  n_max = 200,
+  step = 5,
+  seed = NULL,
+  pattern = NULL,
+  verbose = TRUE
+){
+  if (!is.null(seed)) set.seed(seed)
+
+  results <- data.frame(n_unit = integer(), power = numeric())
+
+  for (n in seq(n_min, n_max, by = step)) {
+    p <- powerfinder(
+      n_unit = n, n_time = n_time, p0 = p0, OR = OR, sd_unit = sd_unit,
+      nsim = nsim, alpha = alpha, pattern = pattern
+    )
+    results <- rbind(results, data.frame(n_unit = n, power = p))
+    if (verbose) message("coarse: n_unit = ", n, " -> power = ", round(p, 3))
+
+    if (p >= target_power) {
+      if (step > 1) {
+        n_start <- max(n_min, n - step + 1)
+        for (n2 in seq(n_start, n, by = 1)) {
+          p2 <- powerfinder(
+            n_unit = n2, n_time = n_time, p0 = p0, OR = OR, sd_unit = sd_unit,
+            nsim = nsim, alpha = alpha, pattern = pattern
+          )
+          results <- rbind(results, data.frame(n_unit = n2, power = p2))
+          if (verbose) message(" refine: n_unit = ", n2, " -> power = ", round(p2, 3))
+          if (p2 >= target_power) return(list(min_n_unit = n2, results = results))
+        }
+      }
+      return(list(min_n_unit = n, results = results))
+    }
+  }
+
+  list(min_n_unit = NA_integer_, results = results)
+}
+```
+
+## Example
+```{r}
+set.seed(1)
+out <- unitfinder(
+  target_power = 0.80,
+  n_time = 6,
+  p0 = 0.40,
+  OR = 2.0,
+  sd_unit = 1.0,
+  nsim = 500,
+  step = 5,
+  n_max = 150,
+  verbose = FALSE
+)
+
+out$min_n_unit
+tail(out$results[order(out$results$n_unit), ], 10)
+```
