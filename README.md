@@ -25,6 +25,11 @@ Reads a wide-format SAS census file, reshapes population data to long format, pa
 ### `build_aggregated_census_denominators()`
 Generates an aggregated population denominator dataset from one or more wide-format SAS census files, where population counts are stored in separate columns for sex–race/ethnicity combinations and each row corresponds to a unique state, year, and age. Performs file discovery, header consistency checks, file-level processing, row binding, and optional CSV output.
 
+### PowerCalculation
+This is a .Rmd file that includes two functions:
+1. `powerfinder()` that simulates longitudinal binary data with within-unit correlation and then fits a GEE model to test the condition effect.
+2. `unitfinder()` that searches over candidate n_unit values to find the minimum that achieves target_power.
+
 ## Dependencies
 
 Functions in this repository rely on commonly used R packages, including: `dplyr`; `tidyr`; `stringr`; `forcats`; `rlang`; `haven`; `gtools`; `bayestestR`.
