@@ -1,0 +1,1578 @@
+---
+title: "Mapping free-text country lists to WHO and GBD Regions"
+author: "Daniel Weller"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+This script standardizes messy travel destination text and maps it to WHO and GBD regions. It:
+1. Takes a dataset with a free-text column named traveldest.
+2. Standardizes country names using a manual alias table and a country dictionary.
+3. Maps each destination to WHO subregion, WHO region, and GBD region.
+4. Handles multiple countries in one field.
+5. Flags Mexico and Caribbean where applicable.
+5. Reprocesses unmapped rows using a more flexible tokenizer.
+
+## How matching works:
+1. Text is lowercased and trimmed.
+2. Manual aliases are applied first.
+3. Tokens are matched exactly to country_key.
+4. If no match is found, full-field exactmatch is attempted.
+5. Remaining unmapped rows are re-tokenized more flexibly and matched again.
+
+## Inputs and Outputs
+# Input 
+  1. Dataset named **travellers** with a column named **traveldest**, which is a free-text list of countries
+  2. Dataset anmed **country_dictionary** with at minimum these columns:
+    2.1 country_key: country name (e.g., united states of america, mexico). Use lower-case and no extra whitespace
+    2.2 country_canonical: a shorter version of country name. Use lower-case and no extra whitespace
+    2.3 aliases: ther words/phrases people might type for that country, separated by **;**. Include abbreviations, local names, typos, etc. (e.g., usa; u.s.; us; united states).
+    2.4 exactmatch: full-phrase matches for when the entire field should map to this country (semicolon-separated). Use for odd inputs that should match only as a whole string, or for very short phrases that are often used (e.g., Mx for Mexico).
+    2.5 exclusions: words/phrases which, if present, should remove this country from consideration (semicolon-separated). Use when a phrase is ambiguous. (e.g., to ensure "North Korea" is not matched to "South Korea")
+    2.6 who_subregion, who_region, gbd_region: he region labels you want filled in the output (one value per country)
+    2.7 Optional: gbd_value (numeric) or other region metadata your pipeline currently uses.
+  3. A tibble country_alias_map (two columns: from, to) for high-priority manual alias fixes (e.g., from = "usa", to = "united states of america"). 
+
+# Output:
+1. travellers3 (and travellers4 after second pass).
+2. Added columns: who_subregion_all; who_subregion_single; who_region_all; who_region_single; gbd_region_all; gbd_region_single; unmapped_tokens; Mexico; Caribbean.
+
+# Notes:
+1. Most **improvements should be made in country_dictionary**, not by changing the code. Doing in this code will get messy and introduce the possibility for error
+2. If many rows are Unmapped, add aliases or exactmatch terms.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load your data and Helper Functions
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(forcats)
+library(purrr)
+
+# Normalization helpers ----------
+norm_key <- function(x) {
+  x %>%
+    as.character() %>%
+    str_to_lower() %>%
+    str_squish()
+}
+
+# Apply alias map to a key (exact match on normalized "from")
+apply_alias <- function(keys, alias_from, alias_to) {
+  # keys: normalized vector
+  # alias_from/alias_to: normalized vectors of same length
+  out <- keys
+  m <- match(out, alias_from)
+  out[!is.na(m)] <- alias_to[m[!is.na(m)]]
+  out
+}
+
+# Prepare each mapping table with consistent join keys ----------
+prep_map <- function(df, country_col, ...) {
+  df %>%
+    mutate(
+      country_raw = .data[[country_col]],
+      country_key_pre = norm_key(country_raw),
+      # apply alias to standardize to canonical key
+      country_key = apply_alias(country_key_pre, alias_tbl$from_key, alias_tbl$to_key)
+    ) %>%
+    select(country_key, country_raw, everything(), -country_key_pre)
+}
+
+split_destinations <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  x <- as.character(x) %>% str_to_lower() %>% str_squish()
+  parts <- unlist(str_split(x, "\\s*(;|,|/)\\s*"))
+  parts <- str_squish(parts)
+  parts <- parts[nzchar(parts)]
+  unique(parts)
+}
+
+split_semicolon <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  parts <- unlist(str_split(as.character(x), "\\s*;\\s*"))
+  parts <- str_squish(parts)
+  parts <- parts[nzchar(parts)]
+  unique(parts)
+}
+
+collapse_or_unmapped <- function(x) if (length(x) == 0) "Unmapped" else paste(sort(unique(x)), collapse = ";")
+single_or_multiple <- function(x_all) {
+  if (x_all == "Unmapped") return("Unmapped")
+  if (str_detect(x_all, ";")) return("Multiple")
+  x_all
+}
+```
+
+```{r}
+# helper to build output filenames
+out_csv <- file.path(OUT_DIR, paste0(OUT_PREFIX, "_", format(Sys.Date(), "%Y%m%d"), ".csv"))
+out_rds <- file.path(OUT_DIR, paste0(OUT_PREFIX, "_", format(Sys.Date(), "%Y%m%d"), ".Rds"))
+
+# Read raw data (assumes file exists at the path you provided)
+fdnet <- read_csv(file.path(OUT_DIR, "NAME.csv"), show_col_types = FALSE) %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), NA_character_, tolower(.))))
+colnames(fdnet) <- tolower(colnames(fdnet))
+
+# Keep travellers who traveled (match your original pipeline)
+travellers <- fdnet %>% filter(travelint == "yes")
+
+# Fix the fever recode (small bugfix; minimal)
+travellers <- travellers %>%
+  mutate(fever = if_else(!is.na(fever) & str_starts(fever, "yes ("), "YES", fever))
+```
+
+# Make Alias Map
+## Create data frames to map travel_dest in FoodNet to real countries and regions
+**Note** after creating this dictionary, you may need to go back and add in territories (e.g., Puerto Rico, Falkland Islands) and regions (e.g., Western Europe, West Indies). I have included an existing dictionary in the GIT. If you use this dictionary check to make sure all aliases appropriate to your dataset are captured, and all non-countries in your dataset are captured. If you are using the data dictionary in GIT you can **skip this step**
+```{r cars}
+country_alias_map <- tibble::tribble(
+  ~from, ~to,
+  
+  # United States / UK
+  "usa", "united states of america",
+  "u.s.", "united states of america",
+  "us", "united states of america",
+  "uk", "united kingdom",
+  "england", "united kingdom",
+  "great britain", "united kingdom",
+  "britain", "united kingdom",
+  "scotland", "united kingdom",
+  
+  # DRC / Congo
+  "dr congo", "democratic republic of the congo",
+  "congo (refugee)", "democratic republic of the congo",
+  "congo republic", "congo",
+  
+  # Côte d'Ivoire
+  "ivory coast", "côte d'ivoire",
+  
+  # Tanzania
+  "tanzania", "united republic of tanzania",
+  "dar-es-salaam, tanzania", "united republic of tanzania",
+  
+  # UAE
+  "uae", "united arab emirates",
+  "dubai", "united arab emirates",
+  "dubai airport", "united arab emirates",
+  
+  # Korea
+  "south korea", "republic of korea",
+  "korea (south)", "republic of korea",
+  "north korea", "democratic people's republic of korea",
+  "korea, south", "republic of korea",
+  
+  # Czech
+  "czech republic", "czechia",
+  "czech rep.", "czechia",
+  
+  # Bolivia
+  "bolivia", "bolivia (plurinational state of)",
+  
+  # Venezuela
+  "venezuela", "venezuela (bolivarian republic of)",
+  
+  # Myanmar
+  "burma", "myanmar",
+  "myammar", "myanmar",
+  
+  # El Salvador typos
+  "el alvador", "el salvador",
+  "el slavador", "el salvador",
+  "elsalvador", "el salvador",
+  
+  # Bangladesh typo
+  "bangledesh", "bangladesh",
+  
+  # Ethiopia typos
+  "ehtiopia", "ethiopia",
+  
+  # Mexico typos
+  "mexcio", "mexico",
+  "mesico", "mexico",
+  "mexio", "mexico",
+  
+  # Morocco typos
+  "moracco", "morocco",
+  "morocoo", "morocco",
+  "morrocco", "morocco",
+  "morroco", "morocco",
+  "morocoo", "morocco",
+  
+  # Dominican Republic typos
+  "domincan republic", "dominican republic",
+  "domican republic", "dominican republic",
+  "domimican republic", "dominican republic",
+  "dominican rep", "dominican republic",
+  "dominican rep.", "dominican republic",
+  
+  # Philippines typos
+  "phillipines", "philippines",
+  "phillippines", "philippines",
+  "phillipinnes", "philippines",
+  "phlippines", "philippines",
+  "guatamala/phillippines", "philippines",
+  
+  # Guatemala typos
+  "guatamala", "guatemala",
+  "guatmala", "guatemala",
+  "guatamala/phillippines", "guatemala",
+  
+  # Belize typo
+  "belieze", "belize",
+  
+  # Djibouti typo
+  "dijibouti", "djibouti",
+  
+  # Kazakhstan typo
+  "khazakstan", "kazakhstan",
+  
+  # Nepal typo
+  "napal", "nepal",
+  
+  # Pakistan typo
+  "paskistan", "pakistan",
+  "palistan", "pakistan"
+)
+
+who_region_map <- tibble::tribble(
+  ~country,                             ~who_region,
+  # African Region
+  "Algeria", "Africa",
+  "Angola", "Africa",
+  "Benin", "Africa",
+  "Botswana", "Africa",
+  "Burkina Faso", "Africa",
+  "Burundi", "Africa",
+  "Cabo Verde", "Africa",
+  "Cameroon", "Africa",
+  "Central African Republic", "Africa",
+  "Chad", "Africa",
+  "Comoros", "Africa",
+  "Congo", "Africa",
+  "Côte d'Ivoire", "Africa",
+  "Democratic Republic of the Congo", "Africa",
+  "Equatorial Guinea", "Africa",
+  "Eritrea", "Africa",
+  "Eswatini", "Africa",
+  "Ethiopia", "Africa",
+  "Gabon", "Africa",
+  "Gambia", "Africa",
+  "Ghana", "Africa",
+  "Guinea", "Africa",
+  "Guinea-Bissau", "Africa",
+  "Kenya", "Africa",
+  "Lesotho", "Africa",
+  "Liberia", "Africa",
+  "Madagascar", "Africa",
+  "Malawi", "Africa",
+  "Mali", "Africa",
+  "Mauritania", "Africa",
+  "Mauritius", "Africa",
+  "Mozambique", "Africa",
+  "Namibia", "Africa",
+  "Niger", "Africa",
+  "Nigeria", "Africa",
+  "Rwanda", "Africa",
+  "Sao Tome and Principe", "Africa",
+  "Senegal", "Africa",
+  "Seychelles", "Africa",
+  "Sierra Leone", "Africa",
+  "South Africa", "Africa",
+  "South Sudan", "Africa",
+  "Togo", "Africa",
+  "Uganda", "Africa",
+  "United Republic of Tanzania", "Africa",
+  "Zambia", "Africa",
+  "Zimbabwe", "Africa",
+  
+  # Region of the Americas
+  "Antigua and Barbuda", "Americas",
+  "Argentina", "Americas",
+  "Bahamas", "Americas",
+  "Barbados", "Americas",
+  "Belize", "Americas",
+  "Bolivia (Plurinational State of)", "Americas",
+  "Brazil", "Americas",
+  "Canada", "Americas",
+  "Chile", "Americas",
+  "Colombia", "Americas",
+  "Costa Rica", "Americas",
+  "Cuba", "Americas",
+  "Dominica", "Americas",
+  "Dominican Republic", "Americas",
+  "Ecuador", "Americas",
+  "El Salvador", "Americas",
+  "Grenada", "Americas",
+  "Guatemala", "Americas",
+  "Guyana", "Americas",
+  "Haiti", "Americas",
+  "Honduras", "Americas",
+  "Jamaica", "Americas",
+  "Mexico", "Americas",
+  "Nicaragua", "Americas",
+  "Panama", "Americas",
+  "Paraguay", "Americas",
+  "Peru", "Americas",
+  "Puerto Rico", "Americas",
+  "Saint Kitts and Nevis", "Americas",
+  "Saint Lucia", "Americas",
+  "Saint Vincent and the Grenadines", "Americas",
+  "Suriname", "Americas",
+  "Trinidad and Tobago", "Americas",
+  "United States of America", "Americas",
+  "Uruguay", "Americas",
+  "Venezuela (Bolivarian Republic of)", "Americas",
+  
+  # South-East Asia Region
+  "Bangladesh", "South-East Asia",
+  "Bhutan", "South-East Asia",
+  "Democratic People's Republic of Korea", "South-East Asia",
+  "India", "South-East Asia",
+  "Indonesia", "South-East Asia",
+  "Maldives", "South-East Asia",
+  "Myanmar", "South-East Asia",
+  "Nepal", "South-East Asia",
+  "Sri Lanka", "South-East Asia",
+  "Thailand", "South-East Asia",
+  "Timor-Leste", "South-East Asia",
+  
+  # European Region
+  "Albania", "Europe",
+  "Andorra", "Europe",
+  "Armenia", "Europe",
+  "Austria", "Europe",
+  "Azerbaijan", "Europe",
+  "Belarus", "Europe",
+  "Belgium", "Europe",
+  "Bosnia and Herzegovina", "Europe",
+  "Bulgaria", "Europe",
+  "Croatia", "Europe",
+  "Cyprus", "Europe",
+  "Czechia", "Europe",
+  "Denmark", "Europe",
+  "Estonia", "Europe",
+  "Finland", "Europe",
+  "France", "Europe",
+  "Georgia", "Europe",
+  "Germany", "Europe",
+  "Greece", "Europe",
+  "Hungary", "Europe",
+  "Iceland", "Europe",
+  "Ireland", "Europe",
+  "Israel", "Europe",
+  "Italy", "Europe",
+  "Kazakhstan", "Europe",
+  "Kyrgyzstan", "Europe",
+  "Latvia", "Europe",
+  "Lithuania", "Europe",
+  "Luxembourg", "Europe",
+  "Malta", "Europe",
+  "Monaco", "Europe",
+  "Montenegro", "Europe",
+  "Netherlands", "Europe",
+  "North Macedonia", "Europe",
+  "Norway", "Europe",
+  "Poland", "Europe",
+  "Portugal", "Europe",
+  "Republic of Moldova", "Europe",
+  "Romania", "Europe",
+  "Russian Federation", "Europe",
+  "San Marino", "Europe",
+  "Serbia", "Europe",
+  "Slovakia", "Europe",
+  "Slovenia", "Europe",
+  "Spain", "Europe",
+  "Sweden", "Europe",
+  "Switzerland", "Europe",
+  "Tajikistan", "Europe",
+  "Türkiye", "Europe",
+  "Turkmenistan", "Europe",
+  "Ukraine", "Europe",
+  "United Kingdom of Great Britain and Northern Ireland", "Europe",
+  "Uzbekistan", "Europe",
+  
+  # Eastern Mediterranean Region
+  "Afghanistan", "Eastern Mediterranean",
+  "Bahrain", "Eastern Mediterranean",
+  "Djibouti", "Eastern Mediterranean",
+  "Egypt", "Eastern Mediterranean",
+  "Iran (Islamic Republic of)", "Eastern Mediterranean",
+  "Iraq", "Eastern Mediterranean",
+  "Jordan", "Eastern Mediterranean",
+  "Kuwait", "Eastern Mediterranean",
+  "Lebanon", "Eastern Mediterranean",
+  "Libya", "Eastern Mediterranean",
+  "Morocco", "Eastern Mediterranean",
+  "Oman", "Eastern Mediterranean",
+  "Pakistan", "Eastern Mediterranean",
+  "Qatar", "Eastern Mediterranean",
+  "Saudi Arabia", "Eastern Mediterranean",
+  "Somalia", "Eastern Mediterranean",
+  "Sudan", "Eastern Mediterranean",
+  "Syrian Arab Republic", "Eastern Mediterranean",
+  "Tunisia", "Eastern Mediterranean",
+  "United Arab Emirates", "Eastern Mediterranean",
+  "Yemen", "Eastern Mediterranean",
+  
+  # Western Pacific Region
+  "Australia", "Western Pacific",
+  "Brunei Darussalam", "Western Pacific",
+  "Cambodia", "Western Pacific",
+  "China", "Western Pacific",
+  "Cook Islands", "Western Pacific",
+  "Fiji", "Western Pacific",
+  "Japan", "Western Pacific",
+  "Kiribati", "Western Pacific",
+  "Lao People's Democratic Republic", "Western Pacific",
+  "Malaysia", "Western Pacific",
+  "Marshall Islands", "Western Pacific",
+  "Micronesia (Federated States of)", "Western Pacific",
+  "Mongolia", "Western Pacific",
+  "Nauru", "Western Pacific",
+  "New Zealand", "Western Pacific",
+  "Niue", "Western Pacific",
+  "Palau", "Western Pacific",
+  "Papua New Guinea", "Western Pacific",
+  "Philippines", "Western Pacific",
+  "Republic of Korea", "Western Pacific",
+  "Samoa", "Western Pacific",
+  "Singapore", "Western Pacific",
+  "Solomon Islands", "Western Pacific",
+  "Tokelau", "Western Pacific",
+  "Tonga", "Western Pacific",
+  "Tuvalu", "Western Pacific",
+  "Vanuatu", "Western Pacific",
+  "Viet Nam", "Western Pacific"
+)
+
+# https://web.archive.org/web/20120402202239/http://www.who.int/choice/demography/by_country/en/
+who_subregion_map <- tibble::tribble(
+  ~country, ~who_subregion,
+  
+  "Afghanistan", "EMRD",
+  "Albania", "EURB",
+  "Algeria", "AFRD",
+  "Andorra", "EURA",
+  "Angola", "AFRD",
+  "Antigua And Barbuda", "AMRB",
+  "Argentina", "AMRB",
+  "Armenia", "EURB",
+  "Australia", "WPRA",
+  "Austria", "EURA",
+  "Azerbaijan", "EURB",
+  
+  "Bahamas", "AMRB",
+  "Bahrain", "EMRB",
+  "Bangladesh", "SEARD",
+  "Barbados", "AMRB",
+  "Belarus", "EURC",
+  "Belgium", "EURA",
+  "Belize", "AMRB",
+  "Benin", "AFRD",
+  "Bhutan", "SEARD",
+  "Bolivia", "AMRD",
+  "Bosnia And Herzegovina", "EURB",
+  "Botswana", "AFRE",
+  "Brazil", "AMRB",
+  "Brunei Darussalam", "WPRA",
+  "Bulgaria", "EURB",
+  "Burkina Faso", "AFRD",
+  "Burundi", "AFRE",
+  
+  "Cambodia", "WPRB",
+  "Cameroon", "AFRD",
+  "Canada", "AMRA",
+  "Cape Verde", "AFRD",
+  "Central African Republic", "AFRE",
+  "Chad", "AFRD",
+  "Chile", "AMRB",
+  "China", "WPRB",
+  "Colombia", "AMRB",
+  "Comoros", "AFRD",
+  "Congo", "AFRE",
+  "The Congo, Democratic Republic Of", "AFRE",
+  "Cook Islands", "WPRB",
+  "Costa Rica", "AMRB",
+  "Côte d'Ivoire", "AFRE",
+  "Croatia", "EURA",
+  "Cuba", "AMRB",
+  "Cyprus", "EMRB",
+  "Czech Republic", "EURA",
+  
+  "Democratic Peoples Republic Of Korea", "SEARD",
+  "Democratic Republic Of The Congo", "AFRE",
+  "Denmark", "EURA",
+  "Djibouti", "EMRD",
+  "Dominica", "AMRB",
+  "Dominican Republic", "AMRB",
+  
+  "Ecuador", "AMRD",
+  "Egypt", "EMRD",
+  "El Salvador", "AMRB",
+  "Equatorial Guinea", "AFRD",
+  "Eritrea", "AFRE",
+  "Estonia", "EURC",
+  "Ethiopia", "AFRE",
+  
+  "Fiji", "WPRB",
+  "Finland", "EURA",
+  "France", "EURA",
+  
+  "Gabon", "AFRD",
+  "Gambia", "AFRD",
+  "Georgia", "EURB",
+  "Germany", "EURA",
+  "Ghana", "AFRD",
+  "Greece", "EURA",
+  "Grenada", "AMRB",
+  "Guatemala", "AMRD",
+  "Guinea", "AFRD",
+  "Guinea-Bissau", "AFRD",
+  "Guyana", "AMRB",
+  
+  "Haiti", "AMRD",
+  "Honduras", "AMRB",
+  "Hungary", "EURC",
+  
+  "Iceland", "EURA",
+  "India", "SEARD",
+  "Indonesia", "SEARB",
+  "Iran (Islamic Republic Of)", "EMRB",
+  "Iraq", "EMRD",
+  "Ireland", "EURA",
+  "Israel", "EURA",
+  "Italy", "EURA",
+  
+  "Jamaica", "AMRB",
+  "Japan", "WPRA",
+  "Jordan", "EMRB",
+  
+  "Kazakhstan", "EURC",
+  "Kenya", "AFRE",
+  "Kiribati", "WPRB",
+  "Korea, Democratic Peoples Republic of", "SEARB",
+  "Korea, Republic Of", "WPRB",
+  "Kuwait", "EMRB",
+  "Kyrgyzstan", "EURB",
+  
+  "Lao People's Democratic Republic", "WPRB",
+  "Latvia", "EURC",
+  "Lebanon", "EMRB",
+  "Lesotho", "AFRE",
+  "Liberia", "AFRD",
+  "Libyan Arab Jamahiriya", "EMRB",
+  "Lithuania", "EURC",
+  "Luxembourg", "EURA",
+  
+  "Macedonia, The Former Yugoslav Republic Of", "EURB",
+  "Madagascar", "AFRD",
+  "Malawi", "AFRE",
+  "Malaysia", "WPRB",
+  "Maldives", "SEARD",
+  "Mali", "AFRD",
+  "Malta", "EURA",
+  "Marshall Islands", "WPRB",
+  "Mauritania", "AFRD",
+  "Mauritius", "AFRD",
+  "Mexico", "AMRB",
+  "Micronesia (Federated States Of)", "WPRB",
+  "Moldova, Republic Of", "EURC",
+  "Monaco", "EURA",
+  "Mongolia", "WPRB",
+  "Morocco", "EMRD",
+  "Mozambique", "AFRE",
+  "Myanmar", "SEARD",
+  
+  "Namibia", "AFRE",
+  "Nauru", "WPRB",
+  "Nepal", "SEARD",
+  "Netherlands", "EURA",
+  "New Zealand", "WPRA",
+  "Nicaragua", "AMRD",
+  "Niger", "AFRD",
+  "Nigeria", "AFRD",
+  "Niue", "WPRB",
+  "Norway", "EURA",
+  
+  "Oman", "EMRB",
+  
+  "Pakistan", "EMRD",
+  "Palau", "WPRB",
+  "Panama", "AMRB",
+  "Papua New Guinea", "WPRB",
+  "Paraguay", "AMRB",
+  "Peru", "AMRD",
+  "Philippines", "WPRB",
+  "Poland", "EURB",
+  "Portugal", "EURA",
+  
+  "Qatar", "EMRB",
+  
+  "Republic Of Korea", "WPRB",
+  "Republic Of Moldova", "EURC",
+  "Romania", "EURB",
+  "Russian Federation", "EURC",
+  "Rwanda", "AFRE",
+  
+  "Saint Kitts And Nevis", "AMRB",
+  "Saint Lucia", "AMRB",
+  "Saint Vincent And The Grenadines", "AMRB",
+  "Samoa", "WPRB",
+  "San Marino", "EURA",
+  "Sao Tome And Principe", "AFRD",
+  "Saudi Arabia", "EMRB",
+  "Senegal", "AFRD",
+  "Seychelles", "AFRD",
+  "Sierra Leone", "AFRD",
+  "Singapore", "WPRA",
+  "Slovakia", "EURB",
+  "Slovenia", "EURA",
+  "Somalia", "EMRD",
+  "Solomon Islands", "WPRB",
+  "South Africa", "AFRE",
+  "Spain", "EURA",
+  "Sri Lanka", "SEARB",
+  "Sudan", "EMRD",
+  "Suriname", "AMRB",
+  "Swaziland", "AFRE",
+  "Sweden", "EURA",
+  "Switzerland", "EURA",
+  "Syrian Arab Republic", "EMRB",
+  
+  "Tanzania, United Republic Of", "AFRE",
+  "Tajikistan", "EURB",
+  "Thailand", "SEARB",
+  "The Former Yugoslav Republic Of Macedonia", "EURB",
+  "Timor-Leste", "SEARB",
+  "Togo", "AFRD",
+  "Tonga", "WPRB",
+  "Trinidad And Tobago", "AMRB",
+  "Tunisia", "EMRB",
+  "Turkey", "EURB",
+  "Turkmenistan", "EURB",
+  "Tuvalu", "WPRB",
+  
+  "Uganda", "AFRE",
+  "Ukraine", "EURC",
+  "United Arab Emirates", "EMRB",
+  "United Kingdom", "EURA",
+  "United Republic of Tanzania", "AFRE",
+  "United States Of America", "AMRA",
+  "Uruguay", "AMRB",
+  "Uzbekistan", "EURB",
+  
+  "Vanuatu", "WPRB",
+  "Venezuela", "AMRB",
+  "Viet Nam", "WPRB",
+  
+  "Yemen", "EMRD",
+  "Yugoslavia", "EURB",
+  
+  "Zambia", "AFRE",
+  "Zimbabwe", "AFRE"
+)
+
+# https://ghdx.healthdata.org/countries Global Health Data Exchange
+
+gbd_region_map <- tibble::tribble(
+  ~country, ~gbd_region, ~value,
+  
+  # Andean Latin America
+  "Bolivia (Plurinational State of)", "Andean Latin America", 480,
+  "Ecuador", "Andean Latin America", 848,
+  "Peru", "Andean Latin America", 1031,
+  
+  # Australasia
+  "Australia", "Australasia", 2731,
+  "New Zealand", "Australasia", 1677,
+  
+  # Southeast Asia
+  "Cambodia", "Southeast Asia", 462,
+  "Indonesia", "Southeast Asia", 1539,
+  "Lao People's Democratic Republic", "Southeast Asia", 346,
+  "Malaysia", "Southeast Asia", 949,
+  "Maldives", "Southeast Asia", 278,
+  "Mauritius", "Southeast Asia", 431,
+  "Myanmar", "Southeast Asia", 405,
+  "Philippines", "Southeast Asia", 1121,
+  "Seychelles", "Southeast Asia", 271,
+  "Sri Lanka", "Southeast Asia", 738,
+  "Thailand", "Southeast Asia", 1478,
+  "Timor-Leste", "Southeast Asia", 168,
+  "Viet Nam", "Southeast Asia", 913,
+  
+  # Southern Latin America
+  "Argentina", "Southern Latin America", 1229,
+  "Chile", "Southern Latin America", 1096,
+  "Uruguay", "Southern Latin America", 599,
+  
+  # Southern Sub-Saharan Africa
+  "Botswana", "Southern Sub-Saharan Africa", 381,
+  "Eswatini", "Southern Sub-Saharan Africa", 254,
+  "Lesotho", "Southern Sub-Saharan Africa", 243,
+  "Namibia", "Southern Sub-Saharan Africa", 264,
+  "South Africa", "Southern Sub-Saharan Africa", 1663,
+  "Zimbabwe", "Southern Sub-Saharan Africa", 597,
+  
+  # Tropical Latin America
+  "Brazil", "Tropical Latin America", 3536,
+  "Paraguay", "Tropical Latin America", 501,
+  
+  # Western Europe
+  "Andorra", "Western Europe", 184,
+  "Austria", "Western Europe", 1209,
+  "Belgium", "Western Europe", 1266,
+  "Cyprus", "Western Europe", 618,
+  "Denmark", "Western Europe", 2237,
+  "Finland", "Western Europe", 2084,
+  "France", "Western Europe", 3073,
+  "Germany", "Western Europe", 2491,
+  "Greece", "Western Europe", 1438,
+  "Guernsey", "Western Europe", 17,
+  "Iceland", "Western Europe", 911,
+  "Ireland", "Western Europe", 1337,
+  "Isle of Man", "Western Europe", 7,
+  "Israel", "Western Europe", 1148,
+  "Italy", "Western Europe", 3634,
+  "Jersey", "Western Europe", 18,
+  "Liechtenstein", "Western Europe", 26,
+  "Luxembourg", "Western Europe", 761,
+  "Malta", "Western Europe", 695,
+  "Monaco", "Western Europe", 209,
+  "Netherlands", "Western Europe", 2474,
+  "Norway", "Western Europe", 2121,
+  "Portugal", "Western Europe", 1309,
+  "San Marino", "Western Europe", 292,
+  "Spain", "Western Europe", 3183,
+  "Sweden", "Western Europe", 3336,
+  "Switzerland", "Western Europe", 1273,
+  "United Kingdom", "Western Europe", 6169,
+  "Vatican City", "Western Europe", NA_real_,
+  
+  # Western Sub-Saharan Africa
+  "Benin", "Western Sub-Saharan Africa", 468,
+  "Burkina Faso", "Western Sub-Saharan Africa", 679,
+  "Cabo Verde", "Western Sub-Saharan Africa", 259,
+  "Cameroon", "Western Sub-Saharan Africa", 692,
+  "Chad", "Western Sub-Saharan Africa", 284,
+  "Côte d'Ivoire", "Western Sub-Saharan Africa", 566,
+  "Gambia", "Western Sub-Saharan Africa", 419,
+  "Ghana", "Western Sub-Saharan Africa", 957,
+  "Guinea", "Western Sub-Saharan Africa", 296,
+  "Guinea-Bissau", "Western Sub-Saharan Africa", 271,
+  "Liberia", "Western Sub-Saharan Africa", 335,
+  "Mali", "Western Sub-Saharan Africa", 637,
+  "Mauritania", "Western Sub-Saharan Africa", 256,
+  "Niger", "Western Sub-Saharan Africa", 424,
+  "Nigeria", "Western Sub-Saharan Africa", 2220,
+  "Sao Tome and Principe", "Western Sub-Saharan Africa", 227,
+  "Senegal", "Western Sub-Saharan Africa", 652,
+  "Sierra Leone", "Western Sub-Saharan Africa", 372,
+  "Togo", "Western Sub-Saharan Africa", 379,
+  
+  # Caribbean
+  "Antigua and Barbuda", "Caribbean", 220,
+  "Bahamas", "Caribbean", 257,
+  "Barbados", "Caribbean", 313,
+  "Belize", "Caribbean", 330,
+  "Cuba", "Caribbean", 567,
+  "Dominica", "Caribbean", 214,
+  "Dominican Republic", "Caribbean", 521,
+  "Grenada", "Caribbean", 210,
+  "Guyana", "Caribbean", 264,
+  "Haiti", "Caribbean", 326,
+  "Jamaica", "Caribbean", 482,
+  "Saint Kitts and Nevis", "Caribbean", 284,
+  "Saint Lucia", "Caribbean", 259,
+  "Saint Vincent and the Grenadines", "Caribbean", 259,
+  "Suriname", "Caribbean", 266,
+  "Trinidad and Tobago", "Caribbean", 395,
+  
+  # Central Asia
+  "Armenia", "Central Asia", 553,
+  "Azerbaijan", "Central Asia", 497,
+  "Georgia", "Central Asia", 662,
+  "Kazakhstan", "Central Asia", 409,
+  "Kyrgyzstan", "Central Asia", 500,
+  "Mongolia", "Central Asia", 464,
+  "Tajikistan", "Central Asia", 393,
+  "Turkmenistan", "Central Asia", 327,
+  "Uzbekistan", "Central Asia", 427,
+  
+  # Central Europe
+  "Albania", "Central Europe", 418,
+  "Bosnia and Herzegovina", "Central Europe", 517,
+  "Bulgaria", "Central Europe", 815,
+  "Croatia", "Central Europe", 902,
+  "Czechia", "Central Europe", 1086,
+  "Hungary", "Central Europe", 1032,
+  "Kosovo", "Central Europe", 276,
+  "Montenegro", "Central Europe", 246,
+  "North Macedonia", "Central Europe", 632,
+  "Poland", "Central Europe", 1816,
+  "Romania", "Central Europe", 935,
+  "Serbia", "Central Europe", 449,
+  "Slovakia", "Central Europe", 845,
+  "Slovenia", "Central Europe", 929,
+  
+  # Central Latin America
+  "Colombia", "Central Latin America", 978,
+  "Costa Rica", "Central Latin America", 722,
+  "El Salvador", "Central Latin America", 499,
+  "Guatemala", "Central Latin America", 625,
+  "Honduras", "Central Latin America", 433,
+  "Mexico", "Central Latin America", 1798,
+  "Nicaragua", "Central Latin America", 438,
+  "Panama", "Central Latin America", 594,
+  "Venezuela (Bolivarian Republic of)", "Central Latin America", 732,
+  
+  # Central Sub-Saharan Africa
+  "Angola", "Central Sub-Saharan Africa", 326,
+  "Central African Republic", "Central Sub-Saharan Africa", 273,
+  "Congo", "Central Sub-Saharan Africa", 323,
+  "Democratic Republic of the Congo", "Central Sub-Saharan Africa", 559,
+  "Equatorial Guinea", "Central Sub-Saharan Africa", 215,
+  "Gabon", "Central Sub-Saharan Africa", 305,
+  
+  # East Asia
+  "China", "East Asia", 5933,
+  "Democratic People's Republic of Korea", "East Asia", 88,
+  "Taiwan (Province of China)", "East Asia", 1367,
+  
+  # Eastern Europe
+  "Belarus", "Eastern Europe", 480,
+  "Estonia", "Eastern Europe", 1098,
+  "Latvia", "Eastern Europe", 896,
+  "Lithuania", "Eastern Europe", 1017,
+  "Republic of Moldova", "Eastern Europe", 446,
+  "Russian Federation", "Eastern Europe", 1196,
+  "Ukraine", "Eastern Europe", 724,
+  
+  # Eastern Sub-Saharan Africa
+  "Burundi", "Eastern Sub-Saharan Africa", 309,
+  "Comoros", "Eastern Sub-Saharan Africa", 163,
+  "Djibouti", "Eastern Sub-Saharan Africa", 168,
+  "Eritrea", "Eastern Sub-Saharan Africa", 149,
+  "Ethiopia", "Eastern Sub-Saharan Africa", 1556,
+  "Kenya", "Eastern Sub-Saharan Africa", 1731,
+  "Madagascar", "Eastern Sub-Saharan Africa", 473,
+  "Malawi", "Eastern Sub-Saharan Africa", 649,
+  "Mozambique", "Eastern Sub-Saharan Africa", 568,
+  "Rwanda", "Eastern Sub-Saharan Africa", 444,
+  "Somalia", "Eastern Sub-Saharan Africa", 297,
+  "South Sudan", "Eastern Sub-Saharan Africa", 441,
+  "Uganda", "Eastern Sub-Saharan Africa", 1109,
+  "United Republic of Tanzania", "Eastern Sub-Saharan Africa", 1267,
+  "Zambia", "Eastern Sub-Saharan Africa", 581,
+  
+  # High-income Asia Pacific
+  "Brunei Darussalam", "High-income Asia Pacific", 284,
+  "Japan", "High-income Asia Pacific", 2962,
+  "Republic of Korea", "High-income Asia Pacific", 1795,
+  "Singapore", "High-income Asia Pacific", 1063,
+  
+  # High-income North America
+  "Canada", "High-income North America", 2449,
+  "United States of America", "High-income North America", 12916,
+  
+  # North Africa and Middle East
+  "Afghanistan", "North Africa and Middle East", 315,
+  "Algeria", "North Africa and Middle East", 427,
+  "Bahrain", "North Africa and Middle East", 341,
+  "Egypt", "North Africa and Middle East", 1079,
+  "Iran (Islamic Republic of)", "North Africa and Middle East", 1855,
+  "Iraq", "North Africa and Middle East", 431,
+  "Jordan", "North Africa and Middle East", 542,
+  "Kuwait", "North Africa and Middle East", 502,
+  "Lebanon", "North Africa and Middle East", 380,
+  "Libya", "North Africa and Middle East", 279,
+  "Morocco", "North Africa and Middle East", 552,
+  "Oman", "North Africa and Middle East", 505,
+  "Palestine", "North Africa and Middle East", 421,
+  "Qatar", "North Africa and Middle East", 447,
+  "Saudi Arabia", "North Africa and Middle East", 1075,
+  "Sudan", "North Africa and Middle East", 628,
+  "Syrian Arab Republic", "North Africa and Middle East", 324,
+  "Tunisia", "North Africa and Middle East", 554,
+  "Türkiye", "North Africa and Middle East", 1515,
+  "United Arab Emirates", "North Africa and Middle East", 412,
+  "Western Sahara", "North Africa and Middle East", 552,
+  "Yemen", "North Africa and Middle East", 385,
+  
+  # Oceania
+  "Fiji", "Oceania", 353,
+  "Kiribati", "Oceania", 166,
+  "Marshall Islands", "Oceania", 167,
+  "Micronesia (Federated States of)", "Oceania", 170,
+  "Nauru", "Oceania", 216,
+  "Niue", "Oceania", 237,
+  "Palau", "Oceania", 289,
+  "Papua New Guinea", "Oceania", 420,
+  "Samoa", "Oceania", 236,
+  "Solomon Islands", "Oceania", 181,
+  "Tonga", "Oceania", 221,
+  "Tuvalu", "Oceania", 218,
+  "Vanuatu", "Oceania", 167,
+  
+  # South Asia
+  "Bangladesh", "South Asia", 1204,
+  "Bhutan", "South Asia", 237,
+  "India", "South Asia", 5251,
+  "Nepal", "South Asia", 738,
+  "Pakistan", "South Asia", 1242
+)
+```
+
+## Create Alias Map 
+```{r}
+# Prepare alias map (your input tibble) ----------
+# Expect: country_alias_map with columns: from, to
+alias_tbl <- country_alias_map %>%
+  transmute(
+    from_key = norm_key(from),
+    to_key   = norm_key(to),
+    from_raw = from,
+    to_raw   = to
+  ) %>%
+  distinct(from_key, to_key, .keep_all = TRUE)
+
+who_region_tbl <- prep_map(who_region_map, "country") %>%
+  transmute(country_key, who_region = who_region)
+
+who_subregion_tbl <- prep_map(who_subregion_map, "country") %>%
+  transmute(country_key, who_subregion = who_subregion)
+
+gbd_tbl <- prep_map(gbd_region_map, "country") %>%
+  transmute(country_key, gbd_region = gbd_region, gbd_value = value)
+
+# -uild the master set of keys (union of all sources + alias 'to' targets) ----------
+all_keys <- bind_rows(
+  who_region_tbl %>% distinct(country_key),
+  who_subregion_tbl %>% distinct(country_key),
+  gbd_tbl %>% distinct(country_key),
+  alias_tbl %>% distinct(country_key = to_key)
+) %>%
+  distinct(country_key)
+
+# -Build aliases column (all raw variants that map to same canonical key) ----------
+# Include:
+# - all alias "from" values (raw) that point to this canonical key
+# - plus the canonical name itself (best-effort prettified from alias "to" raw; fallback to key)
+
+canonical_name_tbl <- alias_tbl %>%
+  # choose one representative "to_raw" per to_key (first seen)
+  group_by(to_key) %>%
+  summarise(country_canonical = first(to_raw), .groups = "drop")
+
+aliases_tbl <- alias_tbl %>%
+  group_by(to_key) %>%
+  summarise(
+    aliases = paste(sort(unique(from_raw)), collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  rename(country_key = to_key)
+
+# Join everything into one dictionary ----------
+country_dictionary <- all_keys %>%
+  left_join(canonical_name_tbl %>% rename(country_key = to_key), by = "country_key") %>%
+  mutate(
+    # If we don't have a nice canonical label, title-case the key
+    country_canonical = coalesce(country_canonical, str_to_title(country_key))
+  ) %>%
+  left_join(aliases_tbl, by = "country_key") %>%
+  left_join(who_subregion_tbl %>% distinct(country_key, who_subregion), by = "country_key") %>%
+  left_join(who_region_tbl   %>% distinct(country_key, who_region),   by = "country_key") %>%
+  left_join(gbd_tbl          %>% distinct(country_key, gbd_region, gbd_value), by = "country_key") %>%
+  arrange(country_canonical)
+
+# Optional: add a 'type' column so you can also store non-country phrases later
+country_dictionary <- country_dictionary %>%
+  mutate(type = "country") %>%
+  select(type, country_canonical, country_key, aliases, who_subregion, who_region, gbd_region, gbd_value)
+
+# ---------- 7) Save to CSV ----------
+# readr::write_csv(country_dictionary, (file.path(OUT_DIR, "country_dictionary.csv"))
+```
+
+# Step 1: Exact matching
+
+```{r}
+country_dictionary <- read.csv(file.path(OUT_DIR, "country_dictionary.csv"))
+
+# ---------- read & normalize dictionary (if not already handled above) ----------
+# If you constructed country_dictionary above, it's already present.
+# Otherwise uncomment and read from CSV:
+# country_dictionary <- readr::read_csv(file.path(OUT_DIR, "country_dictionary.csv"), show_col_types = FALSE)
+
+country_dictionary <- country_dictionary %>%
+  mutate(
+    country_key = norm_key(country_key),
+    country_canonical = as.character(country_canonical),
+    aliases_raw = as.character(aliases),
+    exactmatch_raw = as.character(exactmatch),
+    exclusions_raw = as.character(exclusions),
+    who_subregion = as.character(who_subregion),
+    who_region = as.character(who_region),
+    gbd_region = as.character(gbd_region)
+  ) %>%
+  distinct(country_key, .keep_all = TRUE)
+
+# ---------- build alias lookup (country_dictionary$aliases) ----------
+dict_alias_pairs <- country_dictionary %>%
+  mutate(alias_list = map(aliases_raw, split_semicolon)) %>%
+  select(country_key, alias_list) %>%
+  unnest(alias_list) %>%
+  filter(nzchar(alias_list)) %>%
+  transmute(from = norm_key(alias_list), to = country_key)
+
+# ---------- build exactmatch lookup (normalized) ----------
+exactmatch_pairs <- country_dictionary %>%
+  mutate(exact_list = map(exactmatch_raw, split_semicolon)) %>%
+  select(country_key, exact_list) %>%
+  unnest(exact_list) %>%
+  filter(nzchar(exact_list)) %>%
+  transmute(exact = norm_key(exact_list), country_key)
+
+# ---------- build exclusions map (normalized) ----------
+exclusions_map <- country_dictionary %>%
+  mutate(excl_list = map(exclusions_raw, split_semicolon)) %>%
+  select(country_key, excl_list)
+
+# ---------- combine alias sources
+alias_from_manual <- norm_key(country_alias_map$from)
+alias_to_manual   <- norm_key(country_alias_map$to)
+
+alias_from_dict <- dict_alias_pairs$from
+alias_to_dict   <- dict_alias_pairs$to
+
+alias_from <- c(alias_from_manual, alias_from_dict)
+alias_to   <- c(alias_to_manual, alias_to_dict)
+
+stopifnot(length(alias_from) == length(alias_to))
+
+apply_alias_vec <- function(keys, alias_from, alias_to) {
+  out <- keys
+  m <- match(out, alias_from)
+  out[!is.na(m)] <- alias_to[m[!is.na(m)]]
+  out
+}
+
+dict <- country_dictionary %>%
+  mutate(country_key = norm_key(country_key)) %>%
+  distinct(country_key, .keep_all = TRUE)
+
+country_exclusions_for <- function(country_keys) {
+  ex_df <- exclusions_map %>% mutate(country_key = norm_key(country_key))
+  res <- set_names(map(ex_df$excl_list, ~ norm_key(.x)), ex_df$country_key)
+  res[country_keys]
+}
+
+find_exactmatch <- function(traveldest_norm, exactmatch_df = exactmatch_pairs) {
+  if (is.na(traveldest_norm) || !nzchar(traveldest_norm)) return(character(0))
+  hits <- exactmatch_df %>% filter(exact == traveldest_norm) %>% pull(country_key)
+  unique(hits)
+}
+
+exclude_carib <- c("belize","guyana","suriname","bermuda") %>% norm_key()
+
+map_traveldest_exactflow <- function(traveldest_value) {
+  tokens <- split_destinations(traveldest_value)
+  if (length(tokens) == 0) {
+    return(list(
+      who_subregion_all = "Unmapped",
+      who_subregion_single = "Unmapped",
+      who_region_all = "Unmapped",
+      who_region_single = "Unmapped",
+      gbd_region_all = "Unmapped",
+      gbd_region_single = "Unmapped",
+      unmapped_tokens = NA_character_,
+      Mexico = NA_character_,
+      Caribbean = NA_character_
+    ))
+  }
+
+  token_norms <- norm_key(tokens)
+  token_keys <- apply_alias_vec(token_norms, alias_from, alias_to)
+
+  matched <- dict %>% semi_join(tibble(country_key = token_keys), by = "country_key")
+
+  if (nrow(matched) > 0) {
+    ex_map <- country_exclusions_for(matched$country_key)
+    keep_idx <- rep(TRUE, nrow(matched))
+    for (i in seq_len(nrow(matched))) {
+      ck <- matched$country_key[i]
+      excl <- ex_map[[ck]]
+      if (!is.null(excl) && length(excl) > 0) {
+        hit_excl <- any(token_norms %in% excl, na.rm = TRUE)
+        if (isTRUE(hit_excl)) keep_idx[i] <- FALSE
+      }
+    }
+    matched <- matched[keep_idx, , drop = FALSE]
+  }
+
+  if (nrow(matched) == 0) {
+    trav_norm_full <- norm_key(traveldest_value)
+    exact_hits <- find_exactmatch(trav_norm_full)
+    if (length(exact_hits) > 0) {
+      matched <- dict %>% filter(country_key %in% exact_hits)
+      token_keys <- exact_hits
+      unmapped <- character(0)
+    } else {
+      unmatched_tokens <- tokens
+      return(list(
+        who_subregion_all = "Unmapped",
+        who_subregion_single = "Unmapped",
+        who_region_all = "Unmapped",
+        who_region_single = "Unmapped",
+        gbd_region_all = "Unmapped",
+        gbd_region_single = "Unmapped",
+        unmapped_tokens = paste(unique(unmatched_tokens), collapse = "; "),
+        Mexico = NA_character_,
+        Caribbean = NA_character_
+      ))
+    }
+  }
+
+  who_sub <- unique(na.omit(matched$who_subregion))
+  who_reg <- unique(na.omit(matched$who_region))
+  gbd_reg <- unique(na.omit(matched$gbd_region))
+
+  who_sub_all <- collapse_or_unmapped(who_sub)
+  who_reg_all <- collapse_or_unmapped(who_reg)
+  gbd_reg_all  <- collapse_or_unmapped(gbd_reg)
+
+  mexico_flag <- if (any(norm_key(matched$country_key) == "mexico", na.rm = TRUE)) "Yes" else NA_character_
+  carib_flag  <- if (any(matched$gbd_region == "Caribbean" &
+                         !(norm_key(matched$country_key) %in% exclude_carib),
+                         na.rm = TRUE)) "Yes" else NA_character_
+  
+  list(
+    who_subregion_all = who_sub_all,
+    who_subregion_single = single_or_multiple(who_sub_all),
+    who_region_all = who_reg_all,
+    who_region_single = single_or_multiple(who_reg_all),
+    gbd_region_all = gbd_reg_all,
+    gbd_region_single = single_or_multiple(gbd_reg_all),
+    unmapped_tokens = NA_character_,
+    Mexico = mexico_flag,
+    Caribbean = carib_flag
+  )
+}
+
+# ---------- apply to travellers (preserve earlier recode step with country_alias_map first) ----------
+travellers3 <- travellers %>%
+  mutate(
+    traveldest = as.character(traveldest),
+    traveldest = tolower(traveldest),
+    # manual exact full-string recode (keep original behavior)
+    traveldest = dplyr::recode(traveldest, !!!setNames(country_alias_map$to, country_alias_map$from))
+  ) %>%
+  mutate(mapped = purrr::map(traveldest, map_traveldest_exactflow)) %>%
+  tidyr::unnest_wider(mapped)
+```
+
+# Step 2: Remap rows that remain unmapped using a more flexible tokenizer
+```{r}
+# -------------------------
+# 0) Ensure dict is normalized (keys) and distinct
+# -------------------------
+dict <- country_dictionary %>%
+  mutate(country_key = str_squish(str_to_lower(as.character(country_key)))) %>%
+  distinct(country_key, .keep_all = TRUE)
+
+# -------------------------
+# 1) Normalization helpers
+# -------------------------
+norm_text2 <- function(x) {
+  x %>%
+    as.character() %>%
+    str_to_lower() %>%
+    str_replace_all("\\([^)]*\\)", " ") %>%        # drop anything in parentheses
+    str_replace_all("[^a-z0-9\\s]", " ") %>%       # strip punctuation/symbols
+    str_squish()
+}
+
+# protect multiword phrases
+protect_phrases <- dict %>%
+  filter(str_detect(country_key, "\\s")) %>%
+  pull(country_key) %>%
+  unique()
+protect_phrases <- protect_phrases[order(nchar(protect_phrases), decreasing = TRUE)]
+
+protect_text <- function(x, phrases, sep = "__") {
+  if (is.na(x) || !nzchar(x)) return(x)
+  out <- str_to_lower(str_squish(as.character(x)))
+  for (p in phrases) {
+    p_prot <- str_replace_all(p, "\\s+", sep)
+    out <- str_replace_all(out, paste0("\\b", stringr::fixed(p), "\\b"), p_prot)
+  }
+  out
+}
+unprotect_token <- function(tok, sep = "__") str_replace_all(tok, sep, " ")
+
+split_destinations2 <- function(x, phrases_to_protect = protect_phrases) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  x <- str_to_lower(str_squish(as.character(x)))
+  x <- protect_text(x, phrases_to_protect, sep="__")
+  x <- str_replace_all(x, "\\s*&\\s*", ";")
+  x <- str_replace_all(x, "\\s+and\\s+", ";")
+  parts <- unlist(str_split(x, "\\s*(;|,|/)\\s*|\\s+"))
+  parts <- str_squish(parts)
+  parts <- parts[nzchar(parts)]
+  parts <- unprotect_token(parts, sep="__")
+  unique(parts)
+}
+```
+
+## Do the mapping
+```{r}
+# -------------------------
+# 0) Ensure dict is normalized (keys) and distinct
+# -------------------------
+dict <- country_dictionary %>%
+  mutate(country_key = str_squish(str_to_lower(as.character(country_key)))) %>%
+  distinct(country_key, .keep_all = TRUE)
+
+# -------------------------
+# 1) Normalization applied everywhere (traveldest + dictionary terms)
+#    - lower
+#    - drop parentheses content
+#    - punctuation/symbols -> space (so &, ?, +, quotes, etc. are removed)
+#    - squish
+# -------------------------
+norm_text2 <- function(x) {
+  x %>%
+    as.character() %>%
+    str_to_lower() %>%
+    str_replace_all("\\([^)]*\\)", " ") %>%        # drop anything in parentheses
+    str_replace_all("[^a-z0-9\\s]", " ") %>%       # strip punctuation/symbols (incl & ? + ' " etc.)
+    str_squish()
+}
+
+exclude_carib <- c("belize","guyana","suriname","bermuda") %>% norm_key()
+
+map_traveldest2 <- function(traveldest_value) {
+  tokens <- split_destinations2(traveldest_value)
+
+  if (length(tokens) == 0) {
+    return(list(
+      who_subregion_all    = "Unmapped",
+      who_subregion_single = "Unmapped",
+      who_region_all       = "Unmapped",
+      who_region_single    = "Unmapped",
+      gbd_region_all       = "Unmapped",
+      gbd_region_single    = "Unmapped",
+      unmapped_tokens      = NA_character_,
+      Mexico               = NA_character_,
+      Caribbean            = NA_character_
+    ))
+  }
+
+  # optional: alias assist (uae/uk/etc.)
+  token_terms <- apply_alias_vec2(tokens, alias_from2, alias_to2)
+
+  # lookup token_terms -> country_keys
+  hit_tbl <- tibble(term = token_terms) %>%
+    left_join(term_lookup, by = "term")
+
+  keys <- unique(na.omit(hit_tbl$country_key))
+
+  matched <- dict %>%
+    mutate(country_key_norm = norm_text2(country_key)) %>%
+    semi_join(tibble(country_key_norm = keys), by = "country_key_norm")
+
+  unmatched <- unique(hit_tbl$term[is.na(hit_tbl$country_key)])
+  unmatched <- unmatched[nzchar(unmatched)]
+  unmatched <- unmatched[unmatched != "the"]
+
+  who_sub <- unique(na.omit(matched$who_subregion))
+  who_reg <- unique(na.omit(matched$who_region))
+  gbd_reg <- unique(na.omit(matched$gbd_region))
+
+  collapse_or_unmapped <- function(x) {
+    x <- unique(na.omit(x))
+    if (length(x) == 0) "Unmapped" else paste(sort(x), collapse = ";")
+  }
+
+  single_or_multiple <- function(x_all) {
+    if (x_all == "Unmapped") return("Unmapped")
+    if (str_detect(x_all, ";")) return("Multiple")
+    x_all
+  }
+
+  who_sub_all <- collapse_or_unmapped(who_sub)
+  who_reg_all <- collapse_or_unmapped(who_reg)
+  gbd_reg_all <- collapse_or_unmapped(gbd_reg)
+
+  # --- NEW: flags (match your pass-1 logic) ---
+  mexico_flag <- if (any(norm_key(matched$country_key) == "mexico", na.rm = TRUE)) "Yes" else NA_character_
+  carib_flag  <- if (any(matched$gbd_region == "Caribbean" &
+                         !(norm_key(matched$country_key) %in% exclude_carib),
+                         na.rm = TRUE)) "Yes" else NA_character_
+
+  list(
+    who_subregion_all    = who_sub_all,
+    who_subregion_single = single_or_multiple(who_sub_all),
+    who_region_all       = who_reg_all,
+    who_region_single    = single_or_multiple(who_reg_all),
+    gbd_region_all       = gbd_reg_all,
+    gbd_region_single    = single_or_multiple(gbd_reg_all),
+    unmapped_tokens      = if (length(unmatched) == 0) NA_character_ else paste(unmatched, collapse = "; "),
+    Mexico               = mexico_flag,
+    Caribbean            = carib_flag
+  )
+}
+```
+
+```{r}
+# -------------------------
+# 2) Build term -> country_key lookup from:
+#    - country_key
+#    - country_canonical
+#    - aliases (split on ;)
+#    All normalized via norm_text2
+# -------------------------
+term_lookup <- dict %>%
+  transmute(
+    country_key_norm = norm_text2(country_key),
+    canonical_term   = norm_text2(country_canonical),
+    aliases_raw      = if_else(is.na(aliases) | !nzchar(aliases), "", as.character(aliases))
+  ) %>%
+  mutate(
+    alias_list = str_split(aliases_raw, "\\s*;\\s*")
+  ) %>%
+  mutate(
+    term_list = pmap(
+      list(country_key_norm, canonical_term, alias_list),
+      \(k, c, a) unique(c(k, c, a))
+    )
+  ) %>%
+  select(country_key_norm, term_list) %>%
+  unnest(term_list) %>%
+  transmute(
+    term = norm_text2(term_list),
+    country_key = country_key_norm
+  ) %>%
+  filter(
+    nzchar(term),
+    term != "the",                 # drop stopword
+    nchar(term) >= 2               # keep short useful terms here; we’ll gate later if you want
+  ) %>%
+  distinct(term, country_key)
+
+# Optional: if you want to avoid noisy super-short terms, set this to 4
+MIN_TERM_NCHAR <- 4
+term_lookup <- term_lookup %>% filter(nchar(term) >= MIN_TERM_NCHAR)
+
+# -------------------------
+# 3) Build protect_phrases from ALL multi-word terms (NOT just country_key)
+#    Protect longest first.
+# -------------------------
+protect_phrases <- term_lookup %>%
+  filter(str_detect(term, "\\s")) %>%
+  pull(term) %>%
+  unique()
+protect_phrases <- protect_phrases[order(nchar(protect_phrases), decreasing = TRUE)]
+
+protect_text2 <- function(x, phrases, sep="__") {
+  if (is.na(x) || !nzchar(x)) return(x)
+  out <- norm_text2(x)
+  for (p in phrases) {
+    p_prot <- str_replace_all(p, "\\s+", sep)
+    # after norm_text2, tokens are alnum+spaces only, so \\b boundaries behave predictably
+    out <- str_replace_all(out, paste0("\\b", fixed(p), "\\b"), p_prot)
+  }
+  out
+}
+
+unprotect_token2 <- function(tok, sep="__") {
+  str_replace_all(tok, sep, " ")
+}
+
+# -------------------------
+# 4) Tokenizer: normalize+protect first, then split on:
+#    - ; , /
+#    - "&"
+#    - " and "
+#    - whitespace
+#    Then unprotect, drop junk tokens incl "the"
+# -------------------------
+split_destinations2 <- function(x, phrases_to_protect = protect_phrases) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+
+  # normalize + protect multiword terms BEFORE converting "and"/"&"
+  x <- protect_text2(x, phrases_to_protect, sep="__")
+
+  # treat & and "and" as separators (safe because protected phrases already shielded)
+  x <- str_replace_all(x, "\\s*&\\s*", ";")
+  x <- str_replace_all(x, "\\s+and\\s+", ";")
+
+  # split on ; , / OR whitespace
+  parts <- unlist(str_split(x, "\\s*(;|,|/)\\s*|\\s+"))
+  parts <- str_squish(parts)
+  parts <- parts[nzchar(parts)]
+
+  # unprotect back to original multiword terms
+  parts <- unprotect_token2(parts, sep="__")
+
+  # normalize tokens again (ensures no stray chars)
+  parts <- norm_text2(parts)
+
+  # drop "the" and other empty tokens
+  parts <- parts[nzchar(parts)]
+  parts <- parts[parts != "the"]
+
+  unique(parts)
+}
+
+# -------------------------
+# 5) Map traveldest (2nd pass) using term_lookup + your alias_map (optional assist)
+#    - If a token matches a term in term_lookup -> yields country_key(s)
+#    - Then you get regions via dict
+# -------------------------
+# If you want to use your alias vectors too (helps with abbreviations like "uae", "uk", etc.)
+# we apply alias mapping AFTER token normalization.
+# (If alias_from/alias_to aren’t defined in your environment, comment these two lines out)
+alias_from2 <- if (exists("alias_from")) norm_text2(alias_from) else character(0)
+alias_to2   <- if (exists("alias_to"))   norm_text2(alias_to)   else character(0)
+
+apply_alias_vec2 <- function(keys, alias_from, alias_to) {
+  if (length(alias_from) == 0 || length(alias_to) == 0) return(keys)
+  out <- keys
+  m <- match(out, alias_from)
+  out[!is.na(m)] <- alias_to[m[!is.na(m)]]
+  out
+}
+
+exclude_carib <- c("belize","guyana","suriname","bermuda") %>% norm_key()
+
+map_traveldest2 <- function(traveldest_value) {
+  tokens <- split_destinations2(traveldest_value)
+
+  if (length(tokens) == 0) {
+    return(list(
+      who_subregion_all    = "Unmapped",
+      who_subregion_single = "Unmapped",
+      who_region_all       = "Unmapped",
+      who_region_single    = "Unmapped",
+      gbd_region_all       = "Unmapped",
+      gbd_region_single    = "Unmapped",
+      unmapped_tokens      = NA_character_,
+      Mexico               = NA_character_,
+      Caribbean            = NA_character_
+    ))
+  }
+
+  # optional: alias assist
+  token_terms <- apply_alias_vec2(tokens, alias_from2, alias_to2)
+
+  hit_tbl <- tibble(term = token_terms) %>%
+    left_join(term_lookup, by = "term")
+
+  keys <- unique(na.omit(hit_tbl$country_key))
+
+  matched <- dict %>%
+    mutate(country_key_norm = norm_text2(country_key)) %>%
+    semi_join(tibble(country_key_norm = keys), by = "country_key_norm")
+
+  unmatched <- unique(hit_tbl$term[is.na(hit_tbl$country_key)])
+  unmatched <- unmatched[nzchar(unmatched)]
+  unmatched <- unmatched[unmatched != "the"]
+
+  who_sub <- unique(na.omit(matched$who_subregion))
+  who_reg <- unique(na.omit(matched$who_region))
+  gbd_reg <- unique(na.omit(matched$gbd_region))
+
+  collapse_or_unmapped <- function(x) {
+    x <- unique(na.omit(x))
+    if (length(x) == 0) "Unmapped" else paste(sort(x), collapse = ";")
+  }
+
+  single_or_multiple <- function(x_all) {
+    if (x_all == "Unmapped") return("Unmapped")
+    if (str_detect(x_all, ";")) return("Multiple")
+    x_all
+  }
+
+  who_sub_all <- collapse_or_unmapped(who_sub)
+  who_reg_all <- collapse_or_unmapped(who_reg)
+  gbd_reg_all <- collapse_or_unmapped(gbd_reg)
+
+  # --- NEW: Mexico + Caribbean flags (same rule as Step 1) ---
+  # Use dict$country_key if it exists; otherwise fall back to country_key_norm
+  ck_vec <- if ("country_key" %in% names(matched)) norm_key(matched$country_key) else matched$country_key_norm
+
+  mexico_flag <- if (any(ck_vec == "mexico", na.rm = TRUE)) "Yes" else NA_character_
+  carib_flag  <- if (any(matched$gbd_region == "Caribbean" & !(ck_vec %in% exclude_carib), na.rm = TRUE)) "Yes" else NA_character_
+
+  list(
+    who_subregion_all    = who_sub_all,
+    who_subregion_single = single_or_multiple(who_sub_all),
+    who_region_all       = who_reg_all,
+    who_region_single    = single_or_multiple(who_reg_all),
+    gbd_region_all       = gbd_reg_all,
+    gbd_region_single    = single_or_multiple(gbd_reg_all),
+    unmapped_tokens      = if (length(unmatched) == 0) NA_character_ else paste(unmatched, collapse = "; "),
+    Mexico               = mexico_flag,
+    Caribbean            = carib_flag
+  )
+}
+
+# -------------------------
+# 6) Apply only to rows needing remap, then overwrite mapping columns in travellers3
+#    Use row_id to merge back cleanly and avoid duplicate-name unnest issues.
+# -------------------------
+# --- Ensure row_id exists ---
+# 1) Ensure a stable row id
+travellers3 <- travellers3 %>% mutate(row_id = dplyr::row_number())
+
+# 2) Columns we will overwrite (include flags)
+cols_to_overwrite <- c(
+  "who_subregion_all","who_subregion_single",
+  "who_region_all","who_region_single",
+  "gbd_region_all","gbd_region_single",
+  "unmapped_tokens",
+  "Mexico","Caribbean"
+)
+
+# 3) Pick rows needing remap
+needs_remap <- travellers3 %>%
+  filter(
+    who_region_all %in% c("", "Unmapped") |
+    gbd_region_all %in% c("", "Unmapped") |
+    !is.na(unmapped_tokens)
+  )
+
+# 4) Remap only those rows.
+# IMPORTANT: names_sep keeps new columns distinct from the existing ones.
+remapped <- needs_remap %>%
+  mutate(mapped2 = purrr::map(traveldest, map_traveldest2)) %>%
+  tidyr::unnest_wider(mapped2, names_sep = "__") %>%
+  transmute(
+    row_id,
+    across(all_of(paste0("mapped2__", cols_to_overwrite)))
+  ) %>%
+  rename_with(~ sub("^mapped2__", "", .x), starts_with("mapped2__"))
+
+# 5) Join back by row_id and overwrite targeted columns (no cur_column / .col)
+travellers4 <- travellers3 %>%
+  left_join(remapped, by = "row_id", suffix = c("", ".new"))
+
+for (nm in cols_to_overwrite) {
+  new_nm <- paste0(nm, ".new")
+  if (new_nm %in% names(travellers4)) {
+    travellers4[[nm]] <- dplyr::coalesce(travellers4[[new_nm]], travellers4[[nm]])
+  }
+}
+
+travellers4 <- travellers4 %>% select(-ends_with(".new"))
+# readr::write_csv(travellers4, out_csv)
+# saveRDS(travellers4, out_rds)
+```
